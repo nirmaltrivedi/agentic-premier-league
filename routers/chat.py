@@ -11,7 +11,7 @@ router = APIRouter()
 graph = build_graph()
 
 genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-_gemini = genai.GenerativeModel("gemini-1.5-flash")
+_gemini = genai.GenerativeModel("gemini-3.1-flash-lite")
 
 
 class ChatRequest(BaseModel):
