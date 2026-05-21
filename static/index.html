@@ -6,48 +6,22 @@
   <link rel="stylesheet" href="/static/css/style.css" />
 </head>
 <body>
-  <div class="container">
 
-    <!-- ── Query card ── -->
-    <div class="card">
-      <h1>Cricket Recap</h1>
-      <p class="hint">
-        Example: "Give me the recap for user 1 and match 1" &nbsp;|&nbsp; "Analyze match 1 for user 2"
-      </p>
-      <div class="input-row">
-        <input type="text" id="msg" placeholder="Type your query and press Enter..." />
-        <button id="btn" onclick="send()">Send</button>
-      </div>
-      <div id="status"></div>
+  <!-- ── Header ── -->
+  <div class="header">
+    <h1>Cricket Recap</h1>
+    <span class="hint">Ask for a recap by name, or ask follow-up questions about the last match</span>
+  </div>
+
+  <!-- ── Message list ── -->
+  <div id="messages"></div>
+
+  <!-- ── Input bar ── -->
+  <div class="input-bar">
+    <div class="input-inner">
+      <input type="text" id="msg" placeholder='e.g. "Show me Arjun&apos;s recap for India vs Pakistan"' />
+      <button id="btn" onclick="send()">Send</button>
     </div>
-
-    <!-- ── Recap card ── -->
-    <div class="card" id="recap-card" style="display: none;">
-
-      <!-- Match + user meta -->
-      <div class="meta">
-        <span class="meta-match" id="r-match"></span>
-        <span>
-          <span class="badge" id="r-user"></span>
-          &nbsp;
-          <span class="badge" id="r-interest"></span>
-        </span>
-      </div>
-
-      <!-- Headline & summary -->
-      <div class="headline" id="r-headline"></div>
-      <div class="summary" id="r-summary"></div>
-
-      <!-- Key moments -->
-      <div class="section-title">Key Moments</div>
-      <div class="highlights" id="r-highlights"></div>
-
-      <!-- Narrative thread -->
-      <div class="section-title">Story of the Match</div>
-      <div class="narrative" id="r-narrative"></div>
-
-    </div>
-
   </div>
 
   <script src="/static/js/main.js"></script>
