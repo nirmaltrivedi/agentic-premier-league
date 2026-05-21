@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Cricket Recap Chat</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: sans-serif;
+      background: #f0f2f5;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      min-height: 100vh;
+      padding: 40px 16px;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 10px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.1);
+      width: 100%;
+      max-width: 700px;
+      padding: 28px;
+    }
+
+    h1 { font-size: 1.4rem; margin-bottom: 4px; }
+
+    .hint {
+      color: #888;
+      font-size: 0.82rem;
+      margin-bottom: 20px;
+    }
+
+    .input-row {
+      display: flex;
+      gap: 8px;
+    }
+
+    input[type="text"] {
+      flex: 1;
+      padding: 10px 12px;
+      font-size: 0.95rem;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      outline: none;
+    }
+
+    input[type="text"]:focus { border-color: #4a90e2; }
+
+    button {
+      padding: 10px 20px;
+      font-size: 0.95rem;
+      background: #4a90e2;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+
+    button:disabled { background: #aac4e8; cursor: default; }
+
+    #status {
+      margin-top: 16px;
+      font-size: 0.85rem;
+      color: #888;
+      min-height: 18px;
+    }
+
+    #status.error { color: #d9534f; }
+
+    pre {
+      margin-top: 16px;
+      background: #f7f8fa;
+      border: 1px solid #e2e4e8;
+      border-radius: 6px;
+      padding: 16px;
+      font-size: 0.82rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 520px;
+      overflow-y: auto;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Cricket Recap</h1>
+    <p class="hint">
+      Example: "Give me the recap for user 1 and match 1" &nbsp;|&nbsp; "Analyze match 1 for user 2"
+    </p>
+
+    <div class="input-row">
+      <input type="text" id="msg" placeholder="Type your query and press Enter..." />
+      <button id="btn" onclick="send()">Send</button>
+    </div>
+
+    <div id="status"></div>
+    <pre id="out"></pre>
+  </div>
+
+  <script>
+    const msgEl    = document.getElementById("msg");
+    const btnEl    = document.getElementById("btn");
+    const statusEl = document.getElementById("status");
+    const outEl    = document.getElementById("out");
+
+    msgEl.addEventListener("keydown", e => {
+      if (e.key === "Enter") { e.preventDefault(); send(); }
+    });
+
+    async function send() {
+      const msg = msgEl.value.trim();
+      if (!msg) return;
+
+      btnEl.disabled = true;
+      statusEl.className = "";
+      statusEl.textContent = "Thinking...";
+      outEl.style.display = "none";
+
+      try {
+        const res = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: msg }),
+        });
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          statusEl.className = "error";
+          statusEl.textContent = data.detail || "Something went wrong.";
+        } else {
+          statusEl.textContent = "";
+          outEl.textContent = JSON.stringify(data, null, 2);
+          outEl.style.display = "block";
+        }
+      } catch (e) {
+        statusEl.className = "error";
+        statusEl.textContent = "Network error: " + e.message;
+      } finally {
+        btnEl.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>
