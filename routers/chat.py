@@ -1,197 +1,129 @@
 import json
 import os
-from typing import Optional
 
 import google.generativeai as genai
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from agent.graph import build_graph
-from db import get_db
 
 router = APIRouter()
 graph  = build_graph()
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
 _gemini = genai.GenerativeModel("gemini-3.1-flash-lite")
 
-
-# ── Pydantic models ────────────────────────────────────────────────────────────
-
-class HistoryMessage(BaseModel):
-    role: str       # "user" | "assistant"
-    content: str    # plain text summary used as context
-
-class ChatRequest(BaseModel):
-    message:     str
-    history:     list[HistoryMessage] = []
-    last_recap:  Optional[dict]       = None   # full recap payload from last response
-
-
-class ChatResponse(BaseModel):
-    type:    str            # "recap" | "text" | "error"
-    message: str            # plain-text answer (always populated)
-    data:    Optional[dict] = None  # recap payload when type == "recap"
+# Human-readable labels shown in the UI progress indicator
+NODE_LABELS = {
+    "route_intent":        "Understanding your request…",
+    "get_user_profile":    "Loading user profile…",
+    "get_match_content":   "Fetching match data…",
+    "extract_key_moments": "Extracting key moments…",
+    "score_relevance":     "Scoring relevance…",
+    "compose_recap":       "Composing recap…",
+    "answer_followup":     "Preparing answer…",
+    "handle_unclear":      "Processing…",
+    "handle_error":        "Processing…",
+    "mark_done":           "Wrapping up…",
+}
 
 
-# ── LLM helpers ───────────────────────────────────────────────────────────────
-
-def _llm(prompt: str) -> str:
-    raw = _gemini.generate_content(prompt).text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    return raw
+class ChatStreamRequest(BaseModel):
+    session_id: str     # client-generated UUID; maps to LangGraph thread_id
+    message:    str
 
 
-def _classify_intent(message: str, has_recap_context: bool) -> str:
-    """Returns 'recap' | 'followup' | 'unclear'."""
-    ctx_note = (
-        "There IS a previously discussed match recap available as context."
-        if has_recap_context
-        else "There is NO prior recap context in this conversation."
-    )
-    prompt = f"""You are a routing agent for a cricket recap assistant.
-{ctx_note}
-
-Classify the user's message into exactly one intent:
-- "recap"    — the user wants a personalized match recap (mentions a person's name and a match/team)
-- "followup" — the user is asking a question about a previously discussed match (only valid if prior context exists)
-- "unclear"  — cannot determine intent
-
-Return ONLY valid JSON: {{"intent": "recap"}} or {{"intent": "followup"}} or {{"intent": "unclear"}}
-
-Message: {message}"""
-    result = json.loads(_llm(prompt))
-    return result.get("intent", "unclear")
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
 
 
-def _extract_recap_params(message: str) -> tuple[str, str]:
-    """Returns (user_name, match_hint). Raises ValueError if either is missing."""
-    prompt = f"""Extract the person's name and the match reference from this message.
-Return ONLY valid JSON with string fields "user_name" and "match_hint".
-Use null if a field cannot be found.
-
-Message: {message}"""
-    parsed = json.loads(_llm(prompt))
-    user_name  = (parsed.get("user_name")  or "").strip()
-    match_hint = (parsed.get("match_hint") or "").strip()
-    if not user_name or not match_hint:
-        raise ValueError("Please mention both a user name and a match in your query.")
-    return user_name, match_hint
-
-
-def _answer_followup(message: str, last_recap: dict, history: list[HistoryMessage]) -> str:
-    history_text = "\n".join(
-        f"{m.role.upper()}: {m.content}" for m in history[-6:]  # last 3 turns
-    ) or "None"
-    prompt = f"""You are a cricket analyst assistant. Answer the user's question using the match recap context below.
-Be concise, insightful, and plain text only (no markdown, no bullet points).
-
-RECAP CONTEXT:
-{json.dumps(last_recap, indent=2)}
-
-CONVERSATION HISTORY:
-{history_text}
-
-USER QUESTION: {message}"""
-    return _llm(prompt)
-
-
-# ── DB lookups ────────────────────────────────────────────────────────────────
-
-def _lookup_user(name: str) -> dict:
-    conn = get_db()
-    with conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM users WHERE LOWER(name) = LOWER(%s)",
-                (name,)
-            )
-            row = cur.fetchone()
-    if row is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No user named '{name}' found in the database."
-        )
-    return dict(row)
-
-
-def _lookup_match(hint: str) -> dict:
-    conn = get_db()
-    with conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM matches WHERE LOWER(title) ILIKE %s ORDER BY id LIMIT 1",
-                (f"%{hint.lower()}%",)
-            )
-            row = cur.fetchone()
-    if row is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No match found matching '{hint}'. Try being more specific (e.g. 'India vs Pakistan T20 World Cup')."
-        )
-    return dict(row)
-
-
-# ── Route ─────────────────────────────────────────────────────────────────────
-
-@router.post("/chat", response_model=ChatResponse,
-             summary="Conversational cricket assistant — recap requests and follow-up questions")
-def chat(req: ChatRequest):
+def _generate_events(session_id: str, message: str):
     """
-    Smart chat endpoint. Routes between two behaviours:
-
-    **Recap request** — mention a user name and a match:
-    > "Give me Arjun's recap for India vs Pakistan"
-
-    **Follow-up question** — ask anything about the last recap:
-    > "Why did Bumrah matter so much in that game?"
-
-    Sends `history` (list of prior messages) and `last_recap` (previous recap payload)
-    to maintain conversation context across turns.
+    Sync generator that yields SSE events:
+      progress  — one per LangGraph node as it completes
+      recap     — full structured recap payload
+      token     — one LLM token at a time (follow-up streaming)
+      text_done — signals end of token stream
+      text      — single plain-text response (unclear / error / done session)
+      done_session — user ended the conversation
+      error     — unrecoverable exception
     """
-    intent = _classify_intent(req.message, has_recap_context=req.last_recap is not None)
-
-    # ── Follow-up ──────────────────────────────────────────────────────────────
-    if intent == "followup":
-        if not req.last_recap:
-            return ChatResponse(
-                type="text",
-                message="I don't have a match recap in context yet. Ask me for a recap first — e.g. 'Show me Arjun's recap for India vs Pakistan'."
-            )
-        answer = _answer_followup(req.message, req.last_recap, req.history)
-        return ChatResponse(type="text", message=answer)
-
-    # ── Unclear ────────────────────────────────────────────────────────────────
-    if intent == "unclear":
-        return ChatResponse(
-            type="text",
-            message="I can generate personalized match recaps and answer follow-up questions. Try: \"Show me Priya's recap for the India vs Australia T20\" or ask something about the last match we discussed."
-        )
-
-    # ── Recap ──────────────────────────────────────────────────────────────────
-    try:
-        user_name, match_hint = _extract_recap_params(req.message)
-    except ValueError as e:
-        return ChatResponse(type="text", message=str(e))
-
-    # These raise HTTPException (404) if not found
-    user  = _lookup_user(user_name)
-    match = _lookup_match(match_hint)
+    config = {"configurable": {"thread_id": session_id}}
 
     try:
-        result = graph.invoke({"user_id": user["id"], "match_id": match["id"]})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Stream node-level progress events
+        for chunk in graph.stream({"user_message": message}, config, stream_mode="updates"):
+            node_name = list(chunk.keys())[0]
+            label = NODE_LABELS.get(node_name, node_name)
+            yield _sse({"type": "progress", "node": node_name, "label": label})
 
-    recap_data = {
-        "user":          result["user_profile"]["name"],
-        "interest_type": result["user_profile"]["interest_type"],
-        "match":         result["match_content"]["match"]["title"],
-        "recap":         result["recap"],
-    }
-    return ChatResponse(
-        type="recap",
-        message=recap_data["recap"]["headline"],
-        data=recap_data,
+        # Read final state from checkpointer
+        final         = graph.get_state(config).values
+        response_type = final.get("response_type") or "unclear"
+
+        if response_type == "recap":
+            data = {
+                "user":          final["user_profile"]["name"],
+                "interest_type": final["user_profile"]["interest_type"],
+                "match":         final["match_content"]["match"]["title"],
+                "recap":         final["recap"],
+            }
+            yield _sse({"type": "recap", "data": data})
+
+        elif response_type == "followup_stream":
+            # Token-level streaming for follow-up answers
+            prompt = final.get("response_text", "")
+            for chunk in _gemini.generate_content(prompt, stream=True):
+                if chunk.text:
+                    yield _sse({"type": "token", "text": chunk.text})
+            yield _sse({"type": "text_done"})
+
+        elif response_type == "done":
+            yield _sse({"type": "done_session"})
+
+        else:
+            # text | error | unclear
+            msg = final.get("response_text") or "I'm not sure how to help with that."
+            yield _sse({"type": "text", "message": msg})
+
+    except Exception as exc:
+        yield _sse({"type": "error", "message": str(exc)})
+
+    yield "data: [DONE]\n\n"
+
+
+@router.post(
+    "/chat/stream",
+    summary="Conversational cricket assistant (SSE streaming)",
+    response_description="Server-Sent Events stream",
+)
+def chat_stream(req: ChatStreamRequest):
+    """
+    Streaming chat endpoint. Returns a `text/event-stream` response.
+
+    Each turn sends one JSON event per SSE `data:` line:
+    - `progress`     — LangGraph node started (with human-readable label)
+    - `recap`        — full personalized recap card
+    - `token`        — one LLM token (follow-up streaming)
+    - `text_done`    — end of token stream
+    - `text`         — single plain-text response
+    - `done_session` — user ended the conversation
+    - `error`        — error message
+
+    **session_id**: generate a UUID client-side on page load; re-use it across
+    turns so the MemorySaver checkpointer maintains conversation state.
+
+    Examples:
+    - `"Show me Arjun's recap for India vs Pakistan"`
+    - `"Why was Bumrah so important in that game?"` (follow-up)
+    - `"done"` (ends session)
+    """
+    return StreamingResponse(
+        _generate_events(req.session_id, req.message),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":   "no-cache",
+            "X-Accel-Buffering": "no",   # disables nginx buffering
+        },
     )

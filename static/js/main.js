@@ -1,15 +1,22 @@
+// ── Session ────────────────────────────────────────────────────────────────────
+// A stable UUID for this page load — maps to one LangGraph MemorySaver thread
+const SESSION_ID = crypto.randomUUID();
+
+// ── DOM refs ───────────────────────────────────────────────────────────────────
 const msgEl      = document.getElementById("msg");
 const btnEl      = document.getElementById("btn");
 const messagesEl = document.getElementById("messages");
 
-// Conversation state
-let history    = [];   // [{role, content}]
-let lastRecap  = null; // last recap payload
+// ── State ──────────────────────────────────────────────────────────────────────
+let sessionEnded = false;
 
-// ── Bootstrap greeting ─────────────────────────────────────────────────────
-appendAssistant("text", "Hi! Ask me for a personalized match recap — e.g. <em>\"Show me Arjun's recap for India vs Pakistan\"</em> — or ask a follow-up question about the last match we discussed.");
+// ── Greeting ───────────────────────────────────────────────────────────────────
+appendAssistant("text",
+  'Hi! Ask me for a personalized match recap — e.g. <em>"Show me Arjun\'s recap for India vs Pakistan"</em> — ' +
+  'or ask a follow-up question about the last match we discussed.'
+);
 
-// ── Input handling ─────────────────────────────────────────────────────────
+// ── Input handling ─────────────────────────────────────────────────────────────
 msgEl.addEventListener("keydown", e => {
   if (e.key === "Enter") { e.preventDefault(); send(); }
 });
@@ -20,50 +27,120 @@ async function send() {
 
   msgEl.value    = "";
   btnEl.disabled = true;
+  msgEl.disabled = true;
 
   appendUser(msg);
-  const thinkingEl = appendThinking();
+
+  // Progress indicator — replaced / removed as nodes fire
+  const progressRow = appendProgress("Thinking…");
 
   try {
-    const res  = await fetch("/chat", {
+    const res = await fetch("/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: msg, history, last_recap: lastRecap }),
+      body: JSON.stringify({ session_id: SESSION_ID, message: msg }),
     });
-    const data = await res.json();
-
-    thinkingEl.remove();
 
     if (!res.ok) {
-      // HTTP error (404, 500, etc.)
-      const detail = data.detail || "Something went wrong.";
-      appendAssistant("error", escHtml(detail));
-      history.push({ role: "user", content: msg });
-      history.push({ role: "assistant", content: detail });
+      progressRow.remove();
+      appendAssistant("error", "Server error " + res.status);
       return;
     }
 
-    if (data.type === "recap") {
-      lastRecap = data.data;
-      appendAssistant("recap", data.data);
-      history.push({ role: "user", content: msg });
-      history.push({ role: "assistant", content: data.message }); // headline as context
-    } else {
-      appendAssistant("text", escHtml(data.message));
-      history.push({ role: "user", content: msg });
-      history.push({ role: "assistant", content: data.message });
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let   buffer  = "";
+
+    // Track the live streaming bubble (for follow-up token streaming)
+    let streamingRow    = null;
+    let streamingBubble = null;
+    let streamedText    = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop(); // keep incomplete last line
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+
+        const raw = line.slice(6).trim();
+        if (raw === "[DONE]") break;
+
+        let event;
+        try { event = JSON.parse(raw); } catch { continue; }
+
+        switch (event.type) {
+
+          case "progress":
+            progressRow.querySelector(".progress-label").textContent = event.label;
+            break;
+
+          case "recap":
+            progressRow.remove();
+            appendAssistant("recap", event.data);
+            break;
+
+          case "token":
+            // First token — create streaming bubble
+            if (!streamingRow) {
+              progressRow.remove();
+              streamingRow = document.createElement("div");
+              streamingRow.className = "msg-row assistant";
+              streamingBubble = document.createElement("div");
+              streamingBubble.className = "bubble streaming-cursor";
+              streamingRow.appendChild(streamingBubble);
+              messagesEl.appendChild(streamingRow);
+            }
+            streamedText += event.text;
+            streamingBubble.textContent = streamedText;
+            scrollBottom();
+            break;
+
+          case "text_done":
+            // Finalise streaming bubble — remove blinking cursor
+            if (streamingBubble) {
+              streamingBubble.classList.remove("streaming-cursor");
+            }
+            streamingRow = streamingBubble = null;
+            streamedText = "";
+            break;
+
+          case "text":
+            progressRow.remove();
+            appendAssistant("text", escHtml(event.message));
+            break;
+
+          case "error":
+            progressRow.remove();
+            appendAssistant("error", escHtml(event.message));
+            break;
+
+          case "done_session":
+            progressRow.remove();
+            appendDoneSession();
+            lockInput();
+            break;
+        }
+      }
     }
 
   } catch (e) {
-    thinkingEl.remove();
+    progressRow.remove();
     appendAssistant("error", "Network error: " + escHtml(e.message));
   } finally {
-    btnEl.disabled = false;
-    msgEl.focus();
+    if (!sessionEnded) {
+      btnEl.disabled = false;
+      msgEl.disabled = false;
+      msgEl.focus();
+    }
   }
 }
 
-// ── Render helpers ─────────────────────────────────────────────────────────
+// ── Render helpers ─────────────────────────────────────────────────────────────
 
 function appendUser(text) {
   const row = document.createElement("div");
@@ -73,10 +150,13 @@ function appendUser(text) {
   scrollBottom();
 }
 
-function appendThinking() {
+function appendProgress(label) {
   const row = document.createElement("div");
-  row.className = "msg-row assistant";
-  row.innerHTML = `<div class="thinking"><span></span><span></span><span></span></div>`;
+  row.className = "progress-row";
+  row.innerHTML = `
+    <div class="progress-dots"><span></span><span></span><span></span></div>
+    <span class="progress-label">${escHtml(label)}</span>
+  `;
   messagesEl.appendChild(row);
   scrollBottom();
   return row;
@@ -91,12 +171,28 @@ function appendAssistant(type, payload) {
   } else if (type === "error") {
     row.innerHTML = `<div class="bubble error-bubble">${payload}</div>`;
   } else {
+    // type === "text" — payload may contain safe HTML (e.g. <em> in greeting)
     row.innerHTML = `<div class="bubble">${payload}</div>`;
   }
 
   messagesEl.appendChild(row);
   scrollBottom();
   return row;
+}
+
+function appendDoneSession() {
+  const el = document.createElement("div");
+  el.className = "session-ended";
+  el.textContent = "Session ended — refresh to start a new conversation";
+  messagesEl.appendChild(el);
+  scrollBottom();
+}
+
+function lockInput() {
+  sessionEnded   = true;
+  msgEl.disabled = true;
+  btnEl.disabled = true;
+  msgEl.placeholder = "Session ended. Refresh to start over.";
 }
 
 function buildRecapCard(data) {
